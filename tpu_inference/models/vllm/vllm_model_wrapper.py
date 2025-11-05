@@ -29,6 +29,8 @@ from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context, set_vllm_model_wrapper_context)
 from tpu_inference.runner.lora_utils import replace_lora_metadata
+from tpu_inference.layers.jax.pool.pooler import Pooler
+from tpu_inference.models.jax.adapters import init_pooler_from_vllm_model
 
 logger = init_logger(__name__)
 
@@ -71,6 +73,7 @@ class VllmModelWrapper:
     rng: PRNGKey
     mesh: Mesh
     model: _VllmRunner
+    pooler: Pooler
 
     def __init__(self, vllm_config: VllmConfig, rng: PRNGKey, mesh: Mesh):
         self.vllm_config = vllm_config
@@ -122,6 +125,10 @@ class VllmModelWrapper:
 
         self.model = _VllmRunner(vllm_model)
         params_and_buffers = shard_model_to_tpu(self.model, self.mesh)
+
+
+        # TODO: need to seperate this params_and_buffer for pooler (some pooler is not stateless)
+        self.pooler = init_pooler_from_vllm_model(vllm_model, self.vllm_config, self.rng, self.mesh)
 
         # Returning to the jax land, so we need to wrap it into a JaxValue.
         return jax_view(params_and_buffers), lora_manager
