@@ -155,6 +155,8 @@ class KVCacheManager:
 
     def maybe_reinitialize_input_batch(self,
                                        kv_cache_config: KVCacheConfig) -> None:
+        if not kv_cache_config.kv_cache_groups:
+            return
         block_sizes = [
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
@@ -178,10 +180,22 @@ class KVCacheManager:
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.maybe_reinitialize_input_batch(kv_cache_config)
 
-        # uniform page size.
+        # if we dont get any kv_cache_groups, we can assume it was pure encoder model
+        # the implementation is differnt though from gpu model runner
+        # gpu model runner has a function may_add_encoder_only_layer_to_kv_cache_config
+        # and append this EncoderOnlyAttentionSpec to the kv_cache_groups
+        # not really sure but i think this is related to gpu attention metadatabuilder
+        if not kv_cache_config.kv_cache_groups:
+            self.runner.layer_name_to_kvcache_index = {}
+            self.runner.kv_caches = []
+            self.runner.is_encoder_only = True
+            logger.info("Init kv-cache | encoder-only attention detected; skipping allocation")
+            return
+
         representative_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         page_size_bytes = representative_spec.page_size_bytes
         self.runner.layer_name_to_kvcache_index: Dict[str, int] = {}
+        self.runner.kv_caches = []
         kv_caches = self.runner.kv_caches
         num_blocks_list = []
         for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
