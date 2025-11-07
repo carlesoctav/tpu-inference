@@ -13,6 +13,7 @@ import jax
         "seq_lens",
         "query_start_loc",
         "request_distribution",
+        "req_indices",
     ],
     meta_fields=[],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
@@ -29,6 +30,9 @@ class AttentionMetadata(object):
     query_start_loc: jax.Array = None
     # (3,)
     request_distribution: jax.Array = None
+    #(padded_total_num_scheduled_tokens,)
+    req_indices: jax.Array = None
 
-    query_start_loc_cpu: Any = field(init=False)
-    seq_lens_cpu: Any = field(init=False)
+
+    query_start_loc_cpu: Any = field(init=False, repr = False)
+    seq_lens_cpu: Any = field(init=False, repr = False)

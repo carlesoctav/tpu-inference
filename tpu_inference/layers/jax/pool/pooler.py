@@ -1,4 +1,5 @@
 import enum
+import functools
 from dataclasses import dataclass
 
 import jax
@@ -7,6 +8,43 @@ from flax import nnx
 from tpu_inference.layers.jax.pool.pooling_metadata import TPUSupportedPoolingMetadata, is_partial_prefill
 
 from vllm.config.pooler import PoolerConfig
+
+
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("weight", "bias"),
+    meta_fields=("activation",),
+)
+@dataclass
+class SentenceTransformerDenseLayer:
+    """Single dense layer used by Sentence-Transformers projector."""
+
+    weight: jax.Array
+    bias: jax.Array | None
+    activation: str | None = None
+
+
+@functools.partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("layers",),
+    meta_fields=(),
+)
+@dataclass
+class SentenceTransformerProjector:
+    """Lightweight sequential projector built from ST Dense layers."""
+
+    layers: tuple[SentenceTransformerDenseLayer, ...]
+
+    def __call__(self, inputs: jax.Array) -> jax.Array:
+        outputs = inputs
+        for layer in self.layers:
+            weight = layer.weight
+            bias = layer.bias
+            outputs = outputs @ weight.T
+            if bias is not None:
+                outputs = outputs + bias
+            outputs = _apply_st_activation(outputs, layer.activation)
+        return outputs
 
 
 # [padded_num_reqs, dim]
@@ -100,13 +138,13 @@ class MeanPoolingMethod(PoolingMethod):
         padded_prompt_lens = pooling_metadata.prompt_lens
         padded_start_indices = pooling_metadata.first_token_indices
         padded_end_indices = pooling_metadata.last_token_indices
-        cumsum = jnp.cumsum(hidden_states, dtype=jnp.float32)
+        cumsum = jnp.cumsum(hidden_states, axis=0, dtype=jnp.float32)
 
         return (
             cumsum[padded_end_indices]
             - cumsum[padded_start_indices]
             + hidden_states[padded_start_indices]
-        ) / padded_prompt_lens.unsqueeze(1)
+        ) / padded_prompt_lens[:, None]
 
 
 class LastPoolingMethod(PoolingMethod):
@@ -139,24 +177,26 @@ class PoolerHead(nnx.Module):
 
 
 class EmbeddingPoolerHead(PoolerHead):
-    def __init__(self, default_normalize: bool) -> None:
+    def __init__(
+        self,
+        default_normalize: bool,
+        head_dtype: jnp.dtype,
+        projector: SentenceTransformerProjector | None = None,
+    ) -> None:
         super().__init__()
         self.default_normalize = default_normalize
+        self.head_dtype = head_dtype
+        self.projector = projector
 
     def __call__(
         self,
         pooled: jax.Array,
         pooling_metadata: TPUSupportedPoolingMetadata,
     ) -> PoolerOutput:
+        pooled = pooled.astype(self.head_dtype)
 
-        # In the torch version, this part should handle other computations related to pooling_params, such as
-        # normalization and truncating the embedding dimensions (for matryoshka models).
-        # The problem with TPU is that we want a consistent output shape, and I feel like
-        # the best we can do is to handle this outside JIT, on the CPU.
-        # While you can actually do normalization with jnp.where, or maybe jax.lax.cond for branching in jax.jit,
-        # for the sake of simplicity, we either normalize all requests or none of them based on pooling_config.
-        # Pooler output: [padded_num_reqs, dim]
-
+        if self.projector is not None:
+            pooled = self.projector(pooled)
 
         if self.default_normalize:
             pooled = normalize(pooled)
@@ -171,9 +211,14 @@ class Pooler(nnx.Module):
         raise NotImplementedError("EncodePooler is currently disabled.")
 
     @staticmethod
-    def for_embed(pooler_config: PoolerConfig | None) -> "Pooler":
+    def for_embed(
+        pooler_config: PoolerConfig | None,
+        head_dtype: jnp.dtype | None = None,
+        st_projector: SentenceTransformerProjector | None = None,
+    ) -> "Pooler":
         resolved = ResolvedPoolingConfig.from_config("embed", pooler_config)
-        return EmbeddingPooler.from_config(resolved)
+        dtype = head_dtype or jnp.float32
+        return EmbeddingPooler.from_config(resolved, dtype, st_projector)
 
     def __call__(
         self,
@@ -192,13 +237,18 @@ class EmbeddingPooler(Pooler):
         pooling: PoolingMethod,
         head: EmbeddingPoolerHead,
     ) -> None:
-        self.pooling = pooling 
-        self.head = head 
+        self.pooling = pooling
+        self.head = head
 
     @classmethod
-    def from_config(cls, config: ResolvedPoolingConfig) -> None:
+    def from_config(
+        cls,
+        config: ResolvedPoolingConfig,
+        head_dtype: jnp.dtype,
+        projector: SentenceTransformerProjector | None,
+    ) -> "EmbeddingPooler":
         pooling = PoolingMethod.from_pooling_type(config.pooling_type)
-        head = EmbeddingPoolerHead(config.normalize)
+        head = EmbeddingPoolerHead(config.normalize, head_dtype, projector)
         return cls(pooling, head)
 
     def __call__(
@@ -213,6 +263,31 @@ class EmbeddingPooler(Pooler):
 
     def get_supported_tasks(self) -> set[str]:
         return ("embed",)
+
+
+def _apply_st_activation(x: jax.Array, activation: str | None) -> jax.Array:
+    if activation is None:
+        return x
+
+    name = activation.lower()
+    if name in ("identity", "linear"):
+        return x
+    if name == "relu":
+        return jax.nn.relu(x)
+    if name == "tanh":
+        return jnp.tanh(x)
+    if name == "sigmoid":
+        return jax.nn.sigmoid(x)
+    if name in ("silu", "swish"):
+        return jax.nn.silu(x)
+    if name in ("gelu", "gelu_new"):
+        approximate = name == "gelu_new"
+        return jax.nn.gelu(x, approximate=approximate)
+    if name == "softmax":
+        return jax.nn.softmax(x, axis=-1)
+    if name in ("leakyrelu", "leaky_relu"):
+        return jax.nn.leaky_relu(x)
+    return x
 
 
 def normalize(embeddings: jax.Array) -> jax.Array:

@@ -193,6 +193,8 @@ class CompilationManager:
         query_start_loc = self._create_dummy_tensor(
             (self.runner.max_num_reqs + 1, ), jnp.int32)
 
+        req_indices = self._create_dummy_tensor(input_ids.shape, jnp.int32)
+
         # Keep existing pattern for specific value arrays
         request_distribution = np.array([0, 0, 0], dtype=np.int32)
         request_distribution = device_array(self.runner.mesh,
@@ -203,6 +205,7 @@ class CompilationManager:
             block_tables=block_tables,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
+            req_indices = req_indices,
             request_distribution=request_distribution,
         )
 

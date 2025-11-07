@@ -1008,6 +1008,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Do the padding and copy the tensors to the TPU.
         padded_total_num_scheduled_tokens = runner_utils.get_padded_token_len(
             self.num_tokens_paddings, total_num_scheduled_tokens)
+
+        padded_req_indices = np.concatenate(
+            (
+                req_indices,
+                np.full(
+                    (padded_total_num_scheduled_tokens - len(req_indices),),
+                    self.max_num_reqs + 10,
+                )
+            ), 
+        ) + 1
         # Zero out to avoid spurious values from prev iteration (last cp chunk)
         self.input_ids_cpu[
             total_num_scheduled_tokens:padded_total_num_scheduled_tokens] = 0
@@ -1096,7 +1106,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             block_tables=block_tables,
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
-            request_distribution=request_distribution)
+            request_distribution=request_distribution,
+            req_indices = padded_req_indices
+            )
 
         # This is for making these cpu buffers hidden during tracing
         attention_metadata.query_start_loc_cpu = query_start_loc_cpu

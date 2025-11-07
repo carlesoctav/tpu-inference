@@ -129,6 +129,7 @@ class VllmModelWrapper:
 
         # TODO: need to seperate this params_and_buffer for pooler (some pooler is not stateless)
         self.pooler = init_pooler_from_vllm_model(vllm_model, self.vllm_config, self.rng, self.mesh)
+        print(f"DEBUGPRINT[2]: vllm_model_wrapper.py:131: self.pooler={self.pooler}")
 
         # Returning to the jax land, so we need to wrap it into a JaxValue.
         return jax_view(params_and_buffers), lora_manager

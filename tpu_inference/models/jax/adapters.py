@@ -1,13 +1,25 @@
 import typing as tp
+from typing import TYPE_CHECKING
+
+import io
 
 import torch
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from flax.typing import PRNGKey
 from jax.sharding import Mesh
 
-from tpu_inference.layers.jax.pool.pooler import Pooler
+from tpu_inference.layers.jax.pool.pooler import (Pooler,
+                                                  SentenceTransformerDenseLayer,
+                                                  SentenceTransformerProjector)
+from tpu_inference.logger import init_logger
 from vllm.config import VllmConfig
+from vllm.transformers_utils.config import (get_hf_file_bytes,
+                                            try_get_dense_modules)
+
+if TYPE_CHECKING:
+    from vllm.config import ModelConfig
 
 _T = tp.TypeVar("_T", bound=type[nnx.Module])
 
@@ -15,6 +27,119 @@ _GENERATE_SUFFIXES = (
     "ForCausalLM",
     "ForConditionalGeneration",
 )
+
+_TORCH_TO_JAX_DTYPE = {
+    torch.float16: jnp.float16,
+    torch.bfloat16: jnp.bfloat16,
+    torch.float32: jnp.float32,
+    torch.float64: jnp.float64,
+}
+
+
+def _torch_dtype_to_jax(dtype: torch.dtype | None) -> jnp.dtype:
+    if dtype is None:
+        return jnp.float32
+
+    mapped = _TORCH_TO_JAX_DTYPE.get(dtype)
+    if mapped is None:
+        logger.warning(
+            "Unsupported projector dtype %s; falling back to float32.", dtype
+        )
+        return jnp.float32
+    return mapped
+
+
+def _normalize_activation_name(name: str | None) -> str | None:
+    if not name:
+        return None
+    normalized = name.strip().lower()
+    return normalized or None
+
+
+def _load_dense_weights(
+    folder: str,
+    model_config: "ModelConfig",
+) -> tuple[jnp.ndarray, jnp.ndarray | None] | None:
+    filenames = ("model.safetensors", "pytorch_model.bin")
+    for filename in filenames:
+        file_path = f"{folder}/{filename}" if folder else filename
+        try:
+            file_bytes = get_hf_file_bytes(
+                file_path,
+                model_config.model,
+                model_config.revision,
+            )
+        except Exception:
+            logger.exception("Failed to fetch %s", file_path)
+            continue
+
+        if not file_bytes:
+            continue
+
+        try:
+            if filename.endswith(".safetensors"):
+                from safetensors.torch import load as load_safetensors
+
+                state_dict = load_safetensors(file_bytes)
+            else:
+                state_dict = torch.load(
+                    io.BytesIO(file_bytes), map_location="cpu", weights_only=True
+                )
+        except Exception:
+            logger.exception("Failed to load %s", file_path)
+            continue
+
+        for weight_key in ("weight", "linear.weight", "dense.weight"):
+            if weight_key not in state_dict:
+                continue
+
+            weight = state_dict[weight_key].to(torch.float32).cpu().numpy()
+            bias_key = weight_key.replace("weight", "bias")
+            bias = None
+            if bias_key in state_dict:
+                bias = state_dict[bias_key].to(torch.float32).cpu().numpy()
+            return jnp.asarray(weight), jnp.asarray(bias) if bias is not None else None
+
+    return None
+
+
+def _load_st_projector(
+    model_config: "ModelConfig",
+) -> SentenceTransformerProjector | None:
+    dense_modules = try_get_dense_modules(
+        model_config.model,
+        revision=model_config.revision,
+    )
+
+    if not dense_modules:
+        return None
+
+    dtype = _torch_dtype_to_jax(getattr(model_config, "head_dtype", None))
+    layers: list[SentenceTransformerDenseLayer] = []
+
+    for layer_config in dense_modules:
+        folder = layer_config.get("folder", "")
+        dense_params = _load_dense_weights(folder, model_config)
+        if dense_params is None:
+            continue
+        weight, bias = dense_params
+        activation = _normalize_activation_name(
+            layer_config.get("activation_function")
+        )
+        layers.append(
+            SentenceTransformerDenseLayer(
+                weight=jnp.asarray(weight, dtype=dtype),
+                bias=jnp.asarray(bias, dtype=dtype) if bias is not None else None,
+                activation=activation,
+            )
+        )
+
+    if not layers:
+        return None
+
+    return SentenceTransformerProjector(tuple(layers))
+
+logger = init_logger(__name__)
 
 class PoolingMixin:
     """
@@ -79,7 +204,15 @@ def as_embedding_model(cls: _T) -> _T:
                     "Embedding models require `pooler_config` to be set in the model configuration."
                 )
 
-            self.pooler = Pooler.for_embed(pooler_config)
+            model_config = vllm_config.model_config
+            head_dtype = _torch_dtype_to_jax(getattr(model_config, "head_dtype", None))
+            projector = _load_st_projector(model_config)
+
+            self.pooler = Pooler.for_embed(
+                pooler_config,
+                head_dtype=head_dtype,
+                st_projector=projector,
+            )
 
     ModelForEmbedding.__name__ = _get_pooling_model_name(
         cls.__name__,
@@ -113,4 +246,3 @@ def init_pooler_from_vllm_model(
         raise NotImplementedError(
             f"Pooling initialization for {vllm_model.__class__.__name__} is not implemented."
         )
-

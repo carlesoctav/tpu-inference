@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import jax
 import torch
@@ -13,7 +13,9 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
 
 from tpu_inference import utils
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.jax.attention_interface import attention
+from tpu_inference.layers.jax.attention_interface import (attention,
+                                                          sharded_flash_attention)
+from tpu_inference.kernels.flash_attention.kernel import SegmentIds
 from tpu_inference.logger import init_logger
 from tpu_inference.models.vllm.vllm_model_wrapper_context import \
     get_vllm_model_wrapper_context
@@ -220,31 +222,15 @@ def _jax_attn_func(
 
     return new_kv_cache, outputs
 
-def build_full_attention_mask(
-    attention_metadata: AttentionMetadata
-) -> jax.Array:
-    seq_lens = attention_metadata.seq_lens
-    if seq_lens is None:
-        raise ValueError("attention metadata is missing seq_lens")
-
-    doc_ids = jnp.repeat(
-        jnp.arange(seq_lens.shape[0], dtype=jnp.int32),
-        seq_lens,
-    )
-
-    mask = doc_ids[:, None] == doc_ids[None, :]
-    return mask 
-
-
 @functools.partial(
     jax.jit,
-    static_argnums = (3, 4, 5, 6, 7, 8 )
+    static_argnums = ( 4, 5, 6, 7, 8 )
 )
 def _jax_encoder_attn_func(
     query: jax.Array,
     key: jax.Array, 
     value: jax.Array, 
-    attn_metadata: AttentionMetadata,
+    attention_metadata: AttentionMetadata,
     mesh: Mesh,
     num_heads: int,
     num_kv_heads: int,
@@ -252,31 +238,49 @@ def _jax_encoder_attn_func(
     scale: float,
 ) -> jax.Array: 
 
-    q_len, q_compute_dim = q.shape
-    k_len, k_compute_dim = k.shape
-    assert k.shape == v.shape
+    q_len, q_compute_dim = query.shape
+    k_len, k_compute_dim = key.shape
+    assert key.shape == value.shape
     assert q_compute_dim == head_size * num_heads
     assert k_compute_dim == head_size * num_kv_heads
-    assert q_len == k_len == v.shape[0]
+    assert q_len == k_len
 
-    q = q.reshape((-1, num_heads, head_dim))
-    k = k.reshape((-1, num_kv_heads, head_dim))
-    v = v.reshape((-1, num_kv_heads, head_dim))
-    mask = build_full_mask(attention_metadata)
+    query = query.reshape((1, num_heads, q_len, head_size))
+    key = key.reshape((1, num_kv_heads, k_len, head_size))
+    value = value.reshape((1, num_kv_heads, k_len, head_size))
 
-    assert mask.shape[0] == q.shape[0]
+    if num_kv_heads != num_heads:
+        repeat_factor = num_heads // num_kv_heads
+        key = jnp.repeat(key, repeat_factor, axis=1)
+        value = jnp.repeat(value, repeat_factor, axis=1)
 
-    qkv_spec = P(None, "model", None)
+    block_size = 128
+    seq_len = query.shape[2]
+    pad_len = (block_size - (seq_len % block_size)) % block_size
+    seg_ids = attention_metadata.req_indices.reshape(1, -1)
+    if pad_len:
+        pad_cfg = ((0, 0), (0, 0), (0, pad_len), (0, 0))
+        query = jnp.pad(query, pad_cfg, mode="constant")
+        key = jnp.pad(key, pad_cfg, mode="constant")
+        value = jnp.pad(value, pad_cfg, mode="constant")
+        pad_value = seg_ids[:, -1:]
+        pad_segment = jnp.repeat(pad_value, pad_len, axis=1)
+        seg_ids = jnp.concatenate([seg_ids, pad_segment], axis=1)
 
-    @functools.partial(
-        jax.shard_map,
-        in_specs = (qkv_spec, qkv_spec, qkv_spec, qkv_spec),
-        out_specs = (qkv_spec)
+    segment_ids = SegmentIds(
+        q=seg_ids,
+        kv=seg_ids,
     )
-    def _jax_nn_dot_product_attention(q, k, v, mask):
-        return jax.nn.dot_product_attention(q, k, v, mask = mask)
 
-    outputs = _jax_nn_dot_product_attention(q, k, v , mask)
+    flash_fn = sharded_flash_attention(
+        mesh = mesh,
+        causal = False, 
+        sm_scale = float(scale),
+    )
 
-    outputs = outputs.reshape((-1, num_heads * head_size))
+    outputs_4d = flash_fn(query, key, value, segment_ids)
+    outputs_4d = outputs_4d[:, :, :seq_len, :]
+
+    outputs = outputs_4d[0].transpose(1, 0, 2)
+    outputs = outputs.reshape((seq_len, num_heads * head_size))
     return outputs
